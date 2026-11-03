@@ -208,9 +208,6 @@ jobs:
               await dir!.create(recursive: true);
               _loadVideos();
               try {
-                await Nearby().enableLocationServices();
-              } catch (_) {}
-              try {
                 await Nearby().startAdvertising(
                   tag,
                   Strategy.P2P_CLUSTER,
