@@ -1,0 +1,560 @@
+name: Build APK
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+      - name: Create Android scaffold
+        run: flutter create --platforms=android --project-name p2p_video --org com.example --overwrite .
+      - name: Write app files
+        run: |
+          rm -rf test
+          mkdir -p lib
+          cat > pubspec.yaml <<'EOF_PUBSPEC'
+          name: p2p_video
+          description: Bluetooth P2P video groups
+          publish_to: 'none'
+          version: 1.0.0+1
+
+          environment:
+            sdk: '>=3.3.0 <4.0.0'
+
+          dependencies:
+            flutter:
+              sdk: flutter
+            nearby_connections: ^4.3.0
+            permission_handler: ^11.3.1
+            file_picker: ^8.1.2
+            video_player: ^2.9.1
+            path_provider: ^2.1.4
+
+          flutter:
+            uses-material-design: true
+          EOF_PUBSPEC
+          cat > lib/main.dart <<'EOF_MAIN'
+          import 'dart:convert';
+          import 'dart:io';
+          import 'dart:typed_data';
+
+          import 'package:file_picker/file_picker.dart';
+          import 'package:flutter/material.dart';
+          import 'package:nearby_connections/nearby_connections.dart';
+          import 'package:path_provider/path_provider.dart';
+          import 'package:permission_handler/permission_handler.dart';
+          import 'package:video_player/video_player.dart';
+
+          const String serviceId = 'com.example.p2pvideo';
+          const List<String> videoExts = ['mp4', 'mov', 'mkv', 'avi', '3gp', 'webm', 'm4v'];
+
+          bool isVideoName(String n) => videoExts.contains(n.split('.').last.toLowerCase());
+
+          void main() => runApp(const MyApp());
+
+          class MyApp extends StatelessWidget {
+            const MyApp({super.key});
+
+            @override
+            Widget build(BuildContext context) {
+              return MaterialApp(
+                title: 'فيديو القروب',
+                debugShowCheckedModeBanner: false,
+                theme: ThemeData(useMaterial3: true, colorSchemeSeed: Colors.indigo),
+                builder: (context, child) =>
+                    Directionality(textDirection: TextDirection.rtl, child: child!),
+                home: const JoinPage(),
+              );
+            }
+          }
+
+          class JoinPage extends StatefulWidget {
+            const JoinPage({super.key});
+
+            @override
+            State<JoinPage> createState() => _JoinPageState();
+          }
+
+          class _JoinPageState extends State<JoinPage> {
+            final nameCtrl = TextEditingController();
+            final codeCtrl = TextEditingController();
+
+            Future<void> _join() async {
+              final name = nameCtrl.text.replaceAll('|', '').trim();
+              final code = codeCtrl.text.replaceAll('|', '').trim();
+              if (name.isEmpty || code.isEmpty) {
+                ScaffoldMessenger.of(context)
+                    .showSnackBar(const SnackBar(content: Text('اكتب اسمك وكود القروب')));
+                return;
+              }
+              final res = await [
+                Permission.location,
+                Permission.bluetooth,
+                Permission.bluetoothAdvertise,
+                Permission.bluetoothConnect,
+                Permission.bluetoothScan,
+                Permission.nearbyWifiDevices,
+              ].request();
+              if (!(res[Permission.location]?.isGranted ?? false)) {
+                if (!mounted) return;
+                ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+                    content: Text('يلزم السماح بإذن الموقع والأجهزة القريبة ليعمل البلوتوث')));
+                return;
+              }
+              if (!mounted) return;
+              Navigator.push(
+                  context, MaterialPageRoute(builder: (_) => GroupPage(name: name, code: code)));
+            }
+
+            @override
+            Widget build(BuildContext context) {
+              return Scaffold(
+                appBar: AppBar(title: const Text('فيديو القروب')),
+                body: Padding(
+                  padding: const EdgeInsets.all(24),
+                  child: Column(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      const Icon(Icons.bluetooth_connected, size: 72),
+                      const SizedBox(height: 24),
+                      TextField(
+                        controller: nameCtrl,
+                        decoration: const InputDecoration(
+                            labelText: 'اسمك', border: OutlineInputBorder()),
+                      ),
+                      const SizedBox(height: 16),
+                      TextField(
+                        controller: codeCtrl,
+                        decoration: const InputDecoration(
+                            labelText: 'كود القروب (نفسه عند كل الأعضاء)',
+                            border: OutlineInputBorder()),
+                      ),
+                      const SizedBox(height: 24),
+                      SizedBox(
+                        width: double.infinity,
+                        child: FilledButton.icon(
+                          onPressed: _join,
+                          icon: const Icon(Icons.group),
+                          label: const Text('دخول القروب'),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              );
+            }
+          }
+
+          class GroupPage extends StatefulWidget {
+            final String name;
+            final String code;
+            const GroupPage({super.key, required this.name, required this.code});
+
+            @override
+            State<GroupPage> createState() => _GroupPageState();
+          }
+
+          class _GroupPageState extends State<GroupPage> {
+            final Map<String, String> nameOf = {};
+            final Set<String> peers = {};
+            final Set<String> busy = {};
+            final Map<int, String> names = {};
+            final Map<int, String> uris = {};
+            final Set<int> done = {};
+            final Map<int, double> progress = {};
+            List<File> videos = [];
+            Directory? dir;
+            String status = 'جاري التشغيل...';
+
+            String get tag => '${widget.code}|${widget.name}';
+            String get prefix => '${widget.code}|';
+
+            @override
+            void initState() {
+              super.initState();
+              _init();
+            }
+
+            @override
+            void dispose() {
+              Nearby().stopAdvertising();
+              Nearby().stopDiscovery();
+              Nearby().stopAllEndpoints();
+              super.dispose();
+            }
+
+            void _set(VoidCallback f) {
+              if (mounted) setState(f);
+            }
+
+            void _snack(String t) {
+              if (mounted) {
+                ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(t)));
+              }
+            }
+
+            Future<void> _init() async {
+              final base = await getApplicationDocumentsDirectory();
+              dir = Directory('${base.path}/videos');
+              await dir!.create(recursive: true);
+              _loadVideos();
+              try {
+                await Nearby().enableLocationServices();
+              } catch (_) {}
+              try {
+                await Nearby().startAdvertising(
+                  tag,
+                  Strategy.P2P_CLUSTER,
+                  onConnectionInitiated: _onInit,
+                  onConnectionResult: _onResult,
+                  onDisconnected: _onDisc,
+                  serviceId: serviceId,
+                );
+                await Nearby().startDiscovery(
+                  tag,
+                  Strategy.P2P_CLUSTER,
+                  onEndpointFound: (id, n, s) {
+                    if (!n.startsWith(prefix)) return;
+                    if (peers.contains(id) || busy.contains(id)) return;
+                    busy.add(id);
+                    Nearby()
+                        .requestConnection(
+                          tag,
+                          id,
+                          onConnectionInitiated: _onInit,
+                          onConnectionResult: _onResult,
+                          onDisconnected: _onDisc,
+                        )
+                        .catchError((_) {
+                      busy.remove(id);
+                      return false;
+                    });
+                  },
+                  onEndpointLost: (id) {},
+                  serviceId: serviceId,
+                );
+                _set(() => status = 'يبحث عن أعضاء القروب القريبين...');
+              } catch (e) {
+                _set(() => status = 'خطأ: $e');
+              }
+            }
+
+            void _onInit(String id, ConnectionInfo info) {
+              if (!info.endpointName.startsWith(prefix)) {
+                Nearby().rejectConnection(id);
+                return;
+              }
+              nameOf[id] = info.endpointName.substring(prefix.length);
+              Nearby().acceptConnection(
+                id,
+                onPayLoadRecieved: _onPayload,
+                onPayloadTransferUpdate: _onTransfer,
+              );
+            }
+
+            void _onResult(String id, Status s) {
+              busy.remove(id);
+              _set(() {
+                if (s == Status.CONNECTED) {
+                  peers.add(id);
+                  status = 'متصل مع ${peers.length} عضو';
+                } else {
+                  peers.remove(id);
+                }
+              });
+            }
+
+            void _onDisc(String id) {
+              busy.remove(id);
+              _set(() {
+                peers.remove(id);
+                status = peers.isEmpty
+                    ? 'يبحث عن أعضاء القروب القريبين...'
+                    : 'متصل مع ${peers.length} عضو';
+              });
+            }
+
+            void _onPayload(String id, Payload p) {
+              if (p.type == PayloadType.BYTES && p.bytes != null) {
+                final s = utf8.decode(p.bytes!);
+                final i = s.indexOf(':');
+                if (i < 0) return;
+                final pid = int.tryParse(s.substring(0, i));
+                if (pid == null) return;
+                final name = s.substring(i + 1).split('/').last;
+                if (!isVideoName(name)) {
+                  try {
+                    Nearby().cancelPayload(pid);
+                  } catch (_) {}
+                  uris.remove(pid);
+                  return;
+                }
+                names[pid] = name;
+                _finalize(pid);
+              } else if (p.type == PayloadType.FILE) {
+                if (p.uri != null) uris[p.id] = p.uri!;
+                _finalize(p.id);
+              }
+            }
+
+            void _onTransfer(String id, PayloadTransferUpdate u) {
+              if (u.totalBytes > 0) {
+                progress[u.id] = u.bytesTransferred / u.totalBytes;
+              }
+              if (u.status == PayloadStatus.SUCCESS) {
+                progress.remove(u.id);
+                done.add(u.id);
+                _finalize(u.id);
+              } else if (u.status == PayloadStatus.FAILURE ||
+                  u.status == PayloadStatus.CANCELED) {
+                progress.remove(u.id);
+              }
+              _set(() {});
+            }
+
+            Future<void> _finalize(int pid) async {
+              if (!done.contains(pid) || !names.containsKey(pid) || !uris.containsKey(pid)) {
+                return;
+              }
+              final name = names.remove(pid)!;
+              final uri = uris.remove(pid)!;
+              done.remove(pid);
+              var path = '${dir!.path}/$name';
+              if (File(path).existsSync()) {
+                path = '${dir!.path}/${DateTime.now().millisecondsSinceEpoch}_$name';
+              }
+              final ok = await Nearby().copyFileAndDeleteOriginal(uri, path);
+              if (ok) {
+                _loadVideos();
+                _snack('وصل فيديو جديد');
+              }
+            }
+
+            void _loadVideos() {
+              if (dir == null) return;
+              final l = dir!
+                  .listSync()
+                  .whereType<File>()
+                  .where((f) => isVideoName(f.path))
+                  .toList();
+              l.sort((a, b) => b.lastModifiedSync().compareTo(a.lastModifiedSync()));
+              _set(() => videos = l);
+            }
+
+            Future<void> _pick() async {
+              final r = await FilePicker.platform
+                  .pickFiles(type: FileType.video, allowMultiple: false);
+              if (r == null || r.files.single.path == null) return;
+              final name = r.files.single.name;
+              if (!isVideoName(name)) {
+                _snack('الفيديوهات فقط مسموحة');
+                return;
+              }
+              final dest = File('${dir!.path}/$name');
+              if (!dest.existsSync()) {
+                await File(r.files.single.path!).copy(dest.path);
+              }
+              _loadVideos();
+              await _sendToAll(dest);
+            }
+
+            Future<void> _sendToAll(File f) async {
+              if (peers.isEmpty) {
+                _snack('لا يوجد أعضاء متصلون الآن');
+                return;
+              }
+              final name = f.path.split('/').last;
+              for (final id in peers.toList()) {
+                try {
+                  final pid = await Nearby().sendFilePayload(id, f.path);
+                  await Nearby().sendBytesPayload(
+                      id, Uint8List.fromList(utf8.encode('$pid:$name')));
+                } catch (e) {
+                  _snack('فشل الإرسال: $e');
+                }
+              }
+              _snack('تم إرسال الفيديو');
+            }
+
+            @override
+            Widget build(BuildContext context) {
+              return Scaffold(
+                appBar: AppBar(title: Text('قروب: ${widget.code}')),
+                floatingActionButton: FloatingActionButton.extended(
+                  onPressed: _pick,
+                  icon: const Icon(Icons.video_call),
+                  label: const Text('إرسال فيديو'),
+                ),
+                body: Column(
+                  children: [
+                    Card(
+                      margin: const EdgeInsets.all(12),
+                      child: Padding(
+                        padding: const EdgeInsets.all(12),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(status),
+                            if (peers.isNotEmpty)
+                              Wrap(
+                                spacing: 6,
+                                children: peers
+                                    .map((id) => Chip(label: Text(nameOf[id] ?? id)))
+                                    .toList(),
+                              ),
+                            for (final p in progress.values)
+                              Padding(
+                                padding: const EdgeInsets.only(top: 8),
+                                child: LinearProgressIndicator(value: p),
+                              ),
+                          ],
+                        ),
+                      ),
+                    ),
+                    Expanded(
+                      child: videos.isEmpty
+                          ? const Center(child: Text('لا توجد فيديوهات بعد'))
+                          : ListView.builder(
+                              itemCount: videos.length,
+                              itemBuilder: (c, i) {
+                                final f = videos[i];
+                                final n = f.path.split('/').last;
+                                return ListTile(
+                                  leading: const Icon(Icons.play_circle_fill, size: 36),
+                                  title: Text(n, maxLines: 1, overflow: TextOverflow.ellipsis),
+                                  subtitle: Text(
+                                      '${(f.lengthSync() / 1048576).toStringAsFixed(1)} MB'),
+                                  onTap: () => Navigator.push(
+                                      c,
+                                      MaterialPageRoute(
+                                          builder: (_) => PlayerPage(file: f))),
+                                  trailing: Row(
+                                    mainAxisSize: MainAxisSize.min,
+                                    children: [
+                                      IconButton(
+                                          icon: const Icon(Icons.send),
+                                          onPressed: () => _sendToAll(f)),
+                                      IconButton(
+                                          icon: const Icon(Icons.delete),
+                                          onPressed: () {
+                                            f.deleteSync();
+                                            _loadVideos();
+                                          }),
+                                    ],
+                                  ),
+                                );
+                              },
+                            ),
+                    ),
+                  ],
+                ),
+              );
+            }
+          }
+
+          class PlayerPage extends StatefulWidget {
+            final File file;
+            const PlayerPage({super.key, required this.file});
+
+            @override
+            State<PlayerPage> createState() => _PlayerPageState();
+          }
+
+          class _PlayerPageState extends State<PlayerPage> {
+            late VideoPlayerController c;
+
+            @override
+            void initState() {
+              super.initState();
+              c = VideoPlayerController.file(widget.file)
+                ..initialize().then((_) {
+                  if (mounted) setState(() {});
+                  c.play();
+                });
+            }
+
+            @override
+            void dispose() {
+              c.dispose();
+              super.dispose();
+            }
+
+            @override
+            Widget build(BuildContext context) {
+              return Scaffold(
+                appBar: AppBar(title: Text(widget.file.path.split('/').last)),
+                body: Center(
+                  child: c.value.isInitialized
+                      ? AspectRatio(aspectRatio: c.value.aspectRatio, child: VideoPlayer(c))
+                      : const CircularProgressIndicator(),
+                ),
+                floatingActionButton: FloatingActionButton(
+                  onPressed: () => setState(() {
+                    c.value.isPlaying ? c.pause() : c.play();
+                  }),
+                  child: Icon(c.value.isPlaying ? Icons.pause : Icons.play_arrow),
+                ),
+              );
+            }
+          }
+          EOF_MAIN
+          cat > android/app/src/main/AndroidManifest.xml <<'EOF_MANIFEST'
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+              <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
+              <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30" />
+              <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" android:maxSdkVersion="30" />
+              <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+              <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+              <uses-permission android:name="android.permission.BLUETOOTH_ADVERTISE" />
+              <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+              <uses-permission android:name="android.permission.BLUETOOTH_SCAN" />
+              <uses-permission android:name="android.permission.NEARBY_WIFI_DEVICES" />
+              <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />
+              <application
+                  android:label="فيديو القروب"
+                  android:name="${applicationName}"
+                  android:icon="@mipmap/ic_launcher">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:launchMode="singleTop"
+                      android:taskAffinity=""
+                      android:theme="@style/LaunchTheme"
+                      android:configChanges="orientation|keyboardHidden|keyboard|screenSize|smallestScreenSize|locale|layoutDirection|fontScale|screenLayout|density|uiMode"
+                      android:hardwareAccelerated="true"
+                      android:windowSoftInputMode="adjustResize">
+                      <meta-data
+                          android:name="io.flutter.embedding.android.NormalTheme"
+                          android:resource="@style/NormalTheme" />
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+                  <meta-data android:name="flutterEmbedding" android:value="2" />
+              </application>
+              <queries>
+                  <intent>
+                      <action android:name="android.intent.action.PROCESS_TEXT" />
+                      <data android:mimeType="text/plain" />
+                  </intent>
+              </queries>
+          </manifest>
+          EOF_MANIFEST
+          sed -i 's/minSdk = flutter.minSdkVersion/minSdk = 26/; s/minSdkVersion flutter.minSdkVersion/minSdkVersion 26/' android/app/build.gradle*
+      - run: flutter pub get
+      - run: flutter build apk --release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: app-apk
+          path: build/app/outputs/flutter-apk/app-release.apk
